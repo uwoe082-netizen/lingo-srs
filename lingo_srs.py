@@ -299,9 +299,9 @@ STAGE_TO_DAYS = {"H1": 1, "H3": 3, "H7": 7, "H14": 14}
 
 class _RowDict(dict):
     """Wrapper supaya hasil query bisa diakses row['kolom'] ATAUPUN row[0],
-    persis seperti sqlite3.Row -- tapi dibuat manual dari cursor.description
+    persis seperti sqlite3.Row -- tapi dibuat manual dari nama kolom
     supaya SAMA PERSIS perilakunya baik saat backend-nya sqlite3 lokal
-    maupun saat backend-nya libSQL/Turso (remote)."""
+    maupun saat backend-nya libsql_client/Turso (remote)."""
     def __init__(self, cols, values):
         super().__init__(zip(cols, values))
         self._values = tuple(values)
@@ -324,6 +324,12 @@ class Database:
          - TURSO_DATABASE_URL   (contoh: libsql://nama-db-anda.turso.io)
          - TURSO_AUTH_TOKEN
 
+       Dipakai lewat paket `libsql-client` -- ini paket MURNI PYTHON
+       (cuma ngobrol ke Turso lewat HTTP/WebSocket), BUKAN paket
+       `libsql-experimental` yang berbasis Rust dan sering gagal
+       ter-install di server cloud (perlu compiler Rust, sering tidak
+       ada wheel siap-pakai untuk arsitektur server seperti ARM).
+
     Semua query SQL di file ini (q/q1/exec dan seluruh SRS/Interleaver)
     TIDAK PERLU DIUBAH sama sekali -- keduanya memakai dialek SQLite yang
     sama persis, hanya cara connect-nya yang beda.
@@ -336,62 +342,65 @@ class Database:
         self.using_turso = bool(turso_url and turso_token)
 
         if self.using_turso:
-            import libsql_experimental as libsql
-            # "embedded replica": data disalin ke file lokal sementara,
-            # lalu disinkronkan dua-arah ke Turso lewat conn.sync().
-            local_replica = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lingo_srs_replica.db")
-            self.conn = libsql.connect(local_replica, sync_url=turso_url, auth_token=turso_token)
-            self.conn.sync()
+            import libsql_client
+            self.client = libsql_client.create_client_sync(url=turso_url, auth_token=turso_token)
+            self.conn = None
         else:
             self.conn = sqlite3.connect(path, check_same_thread=False)
+            self.client = None
 
-        self.conn.executescript(SCHEMA)
-        self._commit()
+        for stmt in [s.strip() for s in SCHEMA.split(";") if s.strip()]:
+            self._raw_execute(stmt)
         self._seed_if_empty()
 
-    def _commit(self):
-        self.conn.commit()
+    # -- lapisan paling bawah: satu-satunya tempat yang tahu bedanya
+    #    sqlite3 lokal vs libsql_client (Turso) --
+    def _raw_execute(self, sql, params=()):
         if self.using_turso:
-            self.conn.sync()  # dorong perubahan ke server Turso setiap commit
-
-    def _fetch(self, sql, params, one=False):
-        cur = self.conn.execute(sql, params)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchall()
-        wrapped = [_RowDict(cols, r) for r in rows]
-        return (wrapped[0] if wrapped else None) if one else wrapped
+            rs = self.client.execute(sql, list(params))
+            cols = list(rs.columns) if rs.columns else []
+            rows = [tuple(r) for r in rs.rows]
+            return cols, rows
+        else:
+            cur = self.conn.execute(sql, params)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+            self.conn.commit()
+            return cols, rows
 
     def _seed_if_empty(self):
-        count_row = self._fetch("SELECT COUNT(*) AS c FROM materials", (), one=True)
-        if count_row["c"] > 0:
+        cols, rows = self._raw_execute("SELECT COUNT(*) AS c FROM materials")
+        if rows and rows[0][0] > 0:
             return
         for (lang, level, topic, item_type, day, prompt, answer, hint) in SEED_DATA_15_DAYS:
-            self.conn.execute(
+            self._raw_execute(
                 "INSERT INTO materials (lang, level, topic, item_type, day_seed, prompt, answer, hint) "
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (lang, level, topic, item_type, day, prompt, answer, hint),
             )
-        self._commit()
         print(f"[Setup] {len(SEED_DATA_15_DAYS)} materi bawaan (15 hari pertama) berhasil dimuat ke database.")
 
     # -- helper generik (dipakai di seluruh file, tidak berubah dari luar) --
     def q(self, sql, params=()):
-        return self._fetch(sql, params, one=False)
+        cols, rows = self._raw_execute(sql, params)
+        return [_RowDict(cols, r) for r in rows]
 
     def q1(self, sql, params=()):
-        return self._fetch(sql, params, one=True)
+        rows = self.q(sql, params)
+        return rows[0] if rows else None
 
     def exec(self, sql, params=()):
-        self.conn.execute(sql, params)
-        self._commit()
+        self._raw_execute(sql, params)
 
     def insert_and_get_id(self, sql, params=()):
-        """Insert lalu kembalikan id baris baru -- dipakai untuk tabel sessions.
-        Ditulis sebagai method terpisah (bukan akses cur.lastrowid langsung)
-        supaya berperilaku sama di mode lokal maupun mode Turso."""
-        self.conn.execute(sql, params)
-        self._commit()
-        return self.q1("SELECT last_insert_rowid() AS id")["id"]
+        """Insert lalu kembalikan id baris baru lewat klausa SQL 'RETURNING id'
+        -- dipilih karena berperilaku identik di mode lokal maupun mode Turso,
+        beda dengan last_insert_rowid() yang tidak selalu konsisten lintas
+        koneksi/backend. Catatan: sql yang dikirim ke method ini HARUS berupa
+        INSERT ke tabel yang punya kolom 'id', dan TANPA klausa RETURNING
+        sendiri -- klausa itu ditambahkan otomatis di sini."""
+        cols, rows = self._raw_execute(sql.rstrip().rstrip(";") + " RETURNING id", params)
+        return rows[0][0]
 
 
 # ==============================================================================
