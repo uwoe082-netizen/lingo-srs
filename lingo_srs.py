@@ -104,6 +104,12 @@ COURSERA_TRACKS = {
         {"level": "Mahir", "name": "Academic English: Writing Specialization",
          "provider": "UC Berkeley",
          "url": "https://www.coursera.org/specializations/academic-english"},
+        {"level": "Pemula-Menengah (Speaking)", "name": "Speak English Professionally: In Person, Online & On the Phone",
+         "provider": "Georgia Institute of Technology",
+         "url": "https://www.coursera.org/learn/speak-english-professionally"},
+        {"level": "Menengah-Mahir (Speaking)", "name": "The Pronunciation of American English (Specialization)",
+         "provider": "University of California, Irvine",
+         "url": "https://www.coursera.org/specializations/american-english-pronunciation"},
     ],
     "zh": [
         {"level": "Pemula", "name": "Chinese for Beginners / Chinese Characters for Beginner 汉字",
@@ -121,6 +127,12 @@ COURSERA_TRACKS = {
         {"level": "Mahir", "name": "Chinese for HSK 5-6 / Advanced Reading",
          "provider": "Peking University",
          "url": "https://www.coursera.org/learn/hsk-3"},
+        {"level": "Pemula (Speaking)", "name": "Chinese for Beginners (ABC Chinese) -- fokus speaking, ada latihan VR",
+         "provider": "Peking University",
+         "url": "https://www.coursera.org/learn/learn-chinese"},
+        {"level": "Pemula-Menengah (Speaking)", "name": "More Chinese for Beginners (lanjutan speaking)",
+         "provider": "Peking University",
+         "url": "https://www.coursera.org/learn/more-chinese-for-beginners"},
     ],
 }
 
@@ -343,7 +355,17 @@ class Database:
 
         if self.using_turso:
             import libsql_client
-            self.client = libsql_client.create_client_sync(url=turso_url, auth_token=turso_token)
+            # PENTING: paksa skema URL ke https:// (HTTP biasa), bukan
+            # libsql://. Turso memberi URL dengan skema 'libsql://' yang
+            # oleh libsql-client diterjemahkan jadi koneksi WebSocket --
+            # dan koneksi WebSocket ini sering GAGAL handshake di server
+            # cloud/serverless seperti Streamlit Cloud (bug yang sudah
+            # dilaporkan resmi di GitHub tursodatabase/libsql-client-py
+            # issue #34). Skema https:// memakai HTTP request biasa per
+            # query, jauh lebih andal di lingkungan seperti ini, dan
+            # didukung resmi oleh Turso untuk kebutuhan yang sama.
+            https_url = turso_url.replace("libsql://", "https://", 1)
+            self.client = libsql_client.create_client_sync(url=https_url, auth_token=turso_token)
             self.conn = None
         else:
             self.conn = sqlite3.connect(path, check_same_thread=False)
